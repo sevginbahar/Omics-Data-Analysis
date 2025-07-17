@@ -1,0 +1,341 @@
+---
+title: "RNA seq Workflow with DeSEQ"
+output: html_notebook
+---
+```{r}
+getwd()
+```
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+ if (!requireNamespace("BiocManager", quietly = TRUE))
+     install.packages("BiocManager")
+BiocManager::install("DESeq2", version = "3.14")
+
+```
+BiocManager::install("pheatmap")
+
+
+# RNA-seq Analysis
+
+workflow: raw counts -> normalization -> unsupervised clustering (PCA) -> DE analysis -> shrinking log2 fold change -> results exploration
+- can add more downstream analysis as well
+
+```{r}
+BiocManager::install("pheatmap")
+```
+
+#dependencies
+```{r}
+library(DESeq2)
+library(pheatmap)
+```
+# Preprocessing
+## Reading and rounding the values of raw counts file (geneid x sample names)
+```{r}
+## Loading Input files and creating DESeq2 object
+raw_counts <- read.delim("counts.txt", header = T, row.names = 1)
+raw_counts <- ceiling(raw_counts) #round them up to integers
+head(raw_counts)
+```
+## Loading metadata
+```{r}
+meta_data <- read.delim("sampleGroups.txt", header = T, row.names = 1)
+head(meta_data)
+```
+If the row names of metadata and col names of raw counts data:
+idx <- match(rownames(metadata), colnames(rawcounts))
+and apply the idx to the desired data to be reordered.
+
+## Modelling DeSeq2 Object
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = raw_counts,
+                              colData = meta_data,
+                              design = ~group) #group is the condition:resistant or sensitive in this case
+dds
+```
+
+## Filter out low gene counts
+```{r}
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep,]
+
+```
+
+counts(dds) -> gets the count matrix
+rowSums() -> for each gene counts the samples that are over 10
+
+## DE Analysis
+```{r}
+dds <- DESeq(dds)
+```
+
+
+## Normalization and Log Transformation (transformed counts)
+```{r}
+#estimateSizeFactors(dds)
+#sizeFactors(dds)
+
+#normalization
+norm.counts <- counts(dds, normalized = TRUE) #normalize the counts for accuracy
+write.csv(norm.counts, file = "normalized_counts.txt", row.names = TRUE)
+head(norm.counts)
+
+#log transformation, transformed counts
+vsd <- vst(dds, blind = FALSE) 
+
+#creating as a matrix
+vsd_matrix <- assay(vsd)
+head(vsd_matrix)
+```
+## Adding correlation to log transformation
+```{r}
+vsd_cor <- cor(vsd_matrix) #applies correlation for a pheatmap
+head(vsd_cor)
+vsd_cor <- data.frame(vsd_cor)
+
+pheatmap(vsd_cor, annotation = select(meta_data, group))
+```
+1 indicates strong correlation - shows a good biological relevance.
+- Same groups have correlation of 1.
+
+This plot supports that:
+- Chemo-sensitive and chemo-resistant samples have distinct gene expression profiles -> distinct transcriptomic level.
+- The clustering and correlation structure suggest clear biological separation, which is a good foundation for further differential expression or biomarker analysis.
+
+## Unsupervised Clustering
+```{r}
+plotPCA(vsd, intgroup = c("group")) # does not want the matrix version
+```
+- PC1 explains 87% of the variance — this is the main axis separating your samples.
+- Clear separation between two group -> This suggests strong transcriptomic differences between the two groups.
+- PC2 (8% variance) captures minor variation within groups.
+
+## Hierarchical Clustering
+```{r}
+#plotting hierarchical clustering using vst transformed counts
+sampleDists <- dist(t(assay(vsd)))
+plot(hclust(sampleDists, method = "complete"))
+```
+
+## Plot dispersion estimates -- used DESeq2 object
+```{r}
+mean.counts <- apply(raw_counts[,1:3],1,mean)
+
+var.counts <- apply(raw_counts[,1:3],1,var)
+
+# Plot dispersion estimates to visualize variability in gene expression
+# - Black dots: raw gene-wise dispersion estimates (highly variable for low-count genes)
+# - Red line: fitted trend showing expected dispersion based on mean counts
+# - Blue dots: final dispersion values used in the model (shrunken for stability)
+# This plot helps assess whether DESeq2's dispersion modeling and shrinkage worked correctly
+
+plotDispEsts(dds) 
+
+```
+
+# Key observation:
+ - Low-count genes (left) have high raw dispersion, but shrinkage pulls them toward the red trend line.
+ - High-count genes (right) show less variability and need minimal shrinkage.
+This confirms DESeq2's dispersion estimation and shrinkage worked correctly, improving statistical robustness.
+• As mean counts increase, raw dispersions are more stable; blue ≈ black (less shrinkage needed).
+• Overall fit looks good (no strong systematic deviations), so dispersion modeling succeeded and you can confidently proceed to differential expression testing.
+
+## Get DE results
+```{r}
+dds.res <- results(dds, contrast = c("group","chemo_sensitive", "chemo_resistant"), alpha = 0.05)
+summary(dds.res)
+mcols(dds.res)$description
+
+write.csv(as.data.frame(dds.res), file="DE_sensitiveVSresistant_results.csv")
+```
+Summary of Differential Expression Results:
+- 18,577 genes had a nonzero total read count (i.e., were expressed in at least one sample).
+- 2,156 genes were upregulated in chemo_sensitive vs chemo_resistant (12%).
+- 1,875 genes were downregulated (10%).
+- This means ~22% of all expressed genes are significantly different between the two conditions.
+- 8 genes (0.043%) were flagged as outliers due to extreme values (checked using Cook’s distance).
+- 0 genes were filtered out due to low mean counts (<6), likely because of independent filtering.
+
+```{r}
+plotMA(dds.res)
+```
+- LFC > 0 is up-regulated genes; LFC < 0 is down-regulated genes.
+- Grey points are the genes that are not statistically significant.
+- Blue points genes with p.adj < 0.05 (significantly differentially expressed)
+- There is a large number of significantly differentially expressed genes, especially in genes with moderate-to-high expression (middle x-axis).
+- The triangle markers suggest some genes have very large fold changes and may be biologically interesting.
+
+## Volcano Plot
+```{r}
+BiocManager::install('EnhancedVolcano')
+library(EnhancedVolcano)
+```
+
+```{r}
+EnhancedVolcano(dds.res,
+    lab = rownames(dds.res),
+    x = 'log2FoldChange',
+    y = 'padj')
+```
+- genes to the right are up-regulated due to LFC > 0
+- genes to the left are down-regulated due to LFC < 0
+- higher values are more statisticaly significant
+- There are many red points, meaning a large number of genes show both statistically significant changes and large expression differences between the two conditions.
+- The volcano plot confirms the biological distinction between chemo-sensitive and resistant samples.
+- Genes near the center LFC~0 are not statistically significant.
+
+## Most significant DE genes
+```{r}
+plotCounts(dds, gene=which.min(dds.res$padj), intgroup="group")
+# the lowest padj indicates the most significant gene
+```
+## Visualizing expression data with a heatmap
+```{r}
+# extracting significantly DE genes -- padj < 0.05 & abs(lfc) > 1
+# thresholding for significanlty differentially expressed genes with at least two-ford change in expression
+de.sign <- subset(dds.res, padj < 0.05 & abs(log2FoldChange) > 1)
+
+# creating a vector of Ensembl id for those genes
+de.sign.genes <- rownames(de.sign)
+
+# subseting the vsd matrix to include only the de.sign.genes and scaling it by row so that we plot on the heatmap
+scale.dat <- t(scale(t(assay(vsd)[de.sign.genes,])))
+pheatmap(scale.dat[de.sign.genes,], cluster_rows=TRUE, show_rownames=FALSE, cluster_cols=TRUE)
+```
+
+## Annotating DE Results
+
+```{r}
+BiocManager::install('AnnotationDbi')
+BiocManager::install("org.Hs.eg.db")
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+```
+```{r}
+res.df <- as.data.frame(dds.res) # putting the de.sign into a data.frame to help the next step to work
+res.annot <- mapIds(org.Hs.eg.db, keys = rownames(res.df), keytype = "ENSEMBL", column = "SYMBOL") #mapping ensembl ids to Gene Symbols
+
+res.df.annot <- cbind(res.df,gene.symbol = res.annot) #binding the annotations to the sign.df
+
+head(res.df.annot)
+
+write.csv(res.df.annot, file = "DE_sensitiveVSresistant_results_wGeneSymbol.csv")
+```
+```{r}
+EnhancedVolcano(res.df.annot,
+    lab = res.df.annot$gene.symbol,
+    x = 'log2FoldChange',
+    y = 'padj')
+```
+
+# Over-representation test
+## Install R packages and load libraries
+```{r}
+BiocManager::install("clusterProfiler")
+library(clusterProfiler)
+
+install.packages("msigdbr")
+library(msigdbr)
+```
+msigdbr is an R package that gives you easy access to gene sets from the Molecular Signatures Database (MSigDB) — a widely used resource for gene set enrichment analysis (GSEA).
+
+## Load the C5 collection from MSigDB i.e. Gene Ontologies
+```{r}
+go_gene_sets <- msigdbr(species = "human", category = "C5")  #Load C5
+
+msigdbr_t2g <- go_gene_sets %>% dplyr::distinct(gs_name,gene_symbol) %>% as.data.frame() # make a dataframe of the genesets and the corresponding Ensemble gene ids
+#t processes a gene set data frame (likely created using msigdbr()), and formats it for enrichment analysis, especially for use with clusterProfiler::enricher().
+```
+## Load the DE results file and subset for significantly upregulated genes
+```{r}
+DE.res <- read.csv("DE_sensitiveVSresistant_results_wGeneSymbol.csv", header = TRUE, row.names = 1)
+DE.res.sign <- subset(DE.res, padj < 0.05 & log2FoldChange > 1)
+```
+
+## Perform enrichment analysis and write results in a .csv file
+```{r}
+enrichRes <- enricher(gene = DE.res.sign$gene.symbol, TERM2GENE = msigdbr_t2g, pvalueCutoff = 0.05, pAdjustMethod = "BH")
+write.csv(enrichRes@result, file = "GO_sensitiveVSresistant_up.csv", row.names = FALSE)
+head(enrichRes)
+```
+
+
+# Pre-ranked GSEA
+## Installing packages
+```{r}
+#BiocManager::install("fgsea")
+library(fgsea)
+
+#install.packages("data.table")
+library(data.table)
+
+BiocManager::install("qusage")
+library(qusage)
+
+#install.packages("ggplot2")
+library(ggplot2)
+```
+
+## Load the Gene Set collection (Note you need to download the gmt file of the collection of your interest from MSigDB)
+```{r}
+gmt.file <- read.gmt("c5.go.bp.v7.4.symbols.gmt")
+```
+
+## Ranking our DE results
+```{r}
+DE.res.ranked <- DE.res[order(DE.res$log2FoldChange, decreasing = T), ]
+
+DE.ranks <- setNames(DE.res.ranked$log2FoldChange, DE.res.ranked$gene.symbol) # creating a named vector of the ranks
+```
+
+
+## Running fgsea
+```{r}
+
+fgseaRes <- fgsea(gmt.file, DE.ranks, minSize=15, maxSize=500)
+
+# writing the results into a file
+fwrite(fgseaRes, file = "PrerankedGSEA_gobp_sensitiveVSresistant.txt", sep = "\t", sep2=c("", " ", ""))
+```
+
+## Producing an enrichment plot
+```{r}
+topPathways <- fgseaRes[order(padj)][padj <= 0.05]$pathway
+EnPlot <- plotEnrichment(gmt.file[["GOBP_EPITHELIUM_DEVELOPMENT"]],DE.ranks) + labs(title="GOBP_EPITHELIUM_DEVELOPMENT") + theme(text = element_text(size=20))
+EnPlot2 <- plotEnrichment(gmt.file[["GOBP_OXIDATIVE_PHOSPHORYLATION"]],DE.ranks) + labs(title="GOBP_OXIDATIVE_PHOSPHORYLATION") + theme(text = element_text(size=20))
+
+EnPlot
+EnPlot2
+
+```
+X-axis ("rank"):
+Genes ranked from most upregulated (left) to most downregulated (right) based on a metric (e.g., log2FC, signal-to-noise).
+
+Black ticks:
+Locations of genes from the epithelium development gene set along the ranked gene list.
+
+Green curve:
+The enrichment score (ES) — it reflects how concentrated the gene set is near the top (left) or bottom (right) of the ranked list.
+
+If the peak is on the left: gene set is enriched in upregulated genes.
+
+If on the right: enriched in downregulated genes.
+
+Red dashed lines:
+Indicate the range of observed ES scores; useful for permutation testing.
+
+✅ Interpretation of your plot:
+The green line peaks early, around the left side of the ranked gene list.
+
+This indicates that genes in the GOBP_EPITHELIUM_DEVELOPMENT gene set are enriched at the top of the ranking.
+
+Therefore, this gene set is upregulated (i.e., activated or associated) in your chemo-sensitive group (if that's the direction of the ranking).
+
+🧠 Biological interpretation:
+Epithelium development–related genes are significantly enriched among the most upregulated genes in your condition (likely chemo-sensitive).
+
+This may suggest that epithelial differentiation or maintenance is more active in chemo-sensitive samples.
+
